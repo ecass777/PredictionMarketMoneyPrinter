@@ -2,8 +2,7 @@ import json
 import os
 import pandas as pd
 from .client import PolymarketClient
-from .scanner import scan_markets
-from .config import FEE_RATE, MAX_SLIPPAGE
+from .scanner import compute_simple_sum_arb
 
 
 def load_snapshot(path):
@@ -14,17 +13,13 @@ def load_snapshot(path):
 def compute_snapshot_pnl(markets_raw):
     client = PolymarketClient()
     markets = client.parse_markets(markets_raw)
-    total_edge = 0.0
-    total_count = 0
-    for m in markets:
-        total_ask = m.implied_prob_sum(use_ask=True)
-        if total_ask <= 0:
-            continue
-        gross_edge = 1.0 - total_ask
-        net_edge = gross_edge - FEE_RATE - MAX_SLIPPAGE
-        if net_edge > 0:
-            total_edge += net_edge
-            total_count += 1
+    opportunities = []
+    for market in markets:
+        opp = compute_simple_sum_arb(market)
+        if opp:
+            opportunities.append(opp)
+    total_edge = sum(opp["net_edge"] for opp in opportunities)
+    total_count = len(opportunities)
     return total_edge, total_count
 
 
