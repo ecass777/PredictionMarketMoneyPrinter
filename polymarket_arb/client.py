@@ -127,6 +127,7 @@ class PolymarketClient:
             market_id = m.get("id")
             question = m.get("question")
             group_key = m.get("group", m.get("event_id"))
+            slug = m.get("market_slug") or m.get("slug")
             rules = m.get("rules", "")
             volume = float(m.get("volume", 0) or 0)
             end_time = m.get("end_time")
@@ -143,7 +144,7 @@ class PolymarketClient:
                     best_ask = float(best_ask)
                 outcome = Outcome(oid, name, best_bid, best_ask, liquidity)
                 outcomes.append(outcome)
-            market = Market(market_id, question, group_key, outcomes, rules, volume, end_time)
+            market = Market(market_id, question, group_key, outcomes, rules, volume, end_time, slug=slug)
             markets.append(market)
         return markets
 

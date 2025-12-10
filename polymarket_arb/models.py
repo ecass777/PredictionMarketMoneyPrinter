@@ -18,7 +18,7 @@ class Outcome:
 
 
 class Market:
-    def __init__(self, market_id, question, group_key, outcomes, rules, volume, end_time):
+    def __init__(self, market_id, question, group_key, outcomes, rules, volume, end_time, slug=None):
         self.market_id = market_id
         self.question = question
         self.group_key = group_key
@@ -26,6 +26,7 @@ class Market:
         self.rules = rules
         self.volume = volume
         self.end_time = end_time
+        self.slug = slug
 
     def total_liquidity(self):
         total = 0.0
