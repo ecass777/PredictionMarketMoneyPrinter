@@ -2,3 +2,5 @@ requests
 pandas
 dash
 plotly
+py-clob-client
+pyarrow

@@ -53,7 +53,7 @@ def fetch_all_markets(client):
             break
 
     print("Raw Market Data:")
-    print(json.dumps(markets_list, indent=2))
+    # print(json.dumps(markets_list, indent=2))
 
     return markets_list
 

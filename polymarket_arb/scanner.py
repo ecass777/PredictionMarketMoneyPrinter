@@ -1,6 +1,8 @@
 import json
 import os
 from datetime import datetime
+
+from . import pricing
 from .config import FEE_RATE, MAX_SLIPPAGE, MIN_EDGE, MIN_LIQUIDITY
 from .client import PolymarketClient
 
@@ -23,16 +25,19 @@ def compute_simple_sum_arb(market, min_edge=MIN_EDGE):
     net_edge = gross_edge - FEE_RATE - MAX_SLIPPAGE
     if net_edge <= min_edge:
         return None
-    if market.total_liquidity() < MIN_LIQUIDITY:
+    total_liquidity = market.total_liquidity()
+    if total_liquidity < MIN_LIQUIDITY:
         return None
     return {
         "type": "sum_arb",
         "market_ids": [market.market_id],
+        "slug": getattr(market, "slug", None),
         "group_key": market.group_key,
         "question": market.question,
         "gross_edge": gross_edge,
         "net_edge": net_edge,
         "total_ask": total_ask,
+        "total_liquidity": total_liquidity,
     }
 
 
@@ -66,7 +71,33 @@ def _price_for_outcome(market, outcome_name, use_ask=True):
     return None
 
 
-def scan_strategy_baskets(markets, strategies, *, min_edge=MIN_EDGE, use_ask=True):
+def price_for_leg(slug, outcome, *, price_source="ask", user_id=None, market=None):
+    """
+    Resolve a price for a strategy leg based on the requested source.
+    """
+    source = (price_source or "ask").lower()
+
+    if source in {"ask", "bid", "mid"}:
+        price, _ = pricing.get_order_book_prices_from_csv(slug, outcome, price_type=source)
+        if price is None and market is not None:
+            price = _price_for_outcome(market, outcome, use_ask=source != "bid")
+    elif source == "live":
+        token_id = pricing.get_token_id_for_slug_outcome(slug, outcome)
+        if not token_id:
+            return None
+        price = pricing.get_live_price(token_id)
+    elif source == "actual":
+        price, _ = pricing.get_actual_user_price(slug, outcome, user_id)
+    else:
+        raise ValueError(f"Unsupported price_source: {price_source}")
+
+    try:
+        return float(price) if price is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def scan_strategy_baskets(markets, strategies, *, min_edge=MIN_EDGE, price_source="ask", user_id=None):
     slug_index = _build_slug_index(markets)
     opportunities = []
 
@@ -93,12 +124,17 @@ def scan_strategy_baskets(markets, strategies, *, min_edge=MIN_EDGE, use_ask=Tru
                 missing.append({"slug": slug, "outcome": outcome, "reason": "market_not_found"})
                 continue
 
-            price = _price_for_outcome(market, outcome, use_ask=use_ask)
+            price = price_for_leg(
+                slug,
+                outcome,
+                price_source=price_source,
+                user_id=user_id,
+                market=market,
+            )
             if price is None:
                 missing.append({"slug": slug, "outcome": outcome, "reason": "price_unavailable"})
                 continue
 
-            price = float(price)
             prices.append(price)
             legs.append({
                 "slug": slug,
@@ -126,6 +162,7 @@ def scan_strategy_baskets(markets, strategies, *, min_edge=MIN_EDGE, use_ask=Tru
             "type": "strategy",
             "strategy": trade_name,
             "method": method,
+            "price_source": price_source,
             "gross_edge": gross_edge,
             "net_edge": net_edge,
             "legs": legs,
