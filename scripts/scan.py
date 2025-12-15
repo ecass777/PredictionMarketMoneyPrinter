@@ -1,219 +1,496 @@
 import argparse
-import ast
+import csv
+import json
 import os
 import sys
-from typing import List
+import time
+from datetime import datetime
+from typing import Dict, Generator, List, Optional, Tuple
+
+import requests
 
 # Add project root so polymarket_arb package can be imported when running the script directly
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from polymarket_arb.config import MIN_EDGE
-from polymarket_arb.scanner import (
-    compute_simple_sum_arb,
-    save_opportunities,
-    scan_markets,
-    scan_strategy_baskets,
-)
 from polymarket_arb.client import PolymarketClient
-from polymarket_arb.models import Market, Outcome
-from Polymarket_arbitrage_EC.create_markets_data_csv import fetch_markets_data, generate_markets_csv
+from polymarket_arb.config import MIN_EDGE
+from polymarket_arb.scanner import compute_simple_sum_arb, save_opportunities
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+try:
+    from py_clob_client.client import ClobClient
+except Exception as exc:  # pragma: no cover - surface the import error at runtime
+    ClobClient = None  # type: ignore
 
 
-def _load_markets_from_csv(csv_path: str = "data/markets_data.csv") -> List[Market]:
-    """Load markets from the generated CSV (used to bring in the injected fake market)."""
-    try:
-        import pandas as pd
-    except ImportError:
-        print("DEBUG: pandas not available; cannot load markets from CSV")
+CSV_HEADERS = [
+    "timestamp",
+    "slug",
+    "market_id",
+    "question",
+    "net_edge",
+    "gross_edge",
+    "total_ask",
+    "total_liquidity",
+    "decision_ms",
+]
+
+DEFAULT_HOST = "https://clob.polymarket.com"
+DEFAULT_GAMMA_HOST = "https://gamma-api.polymarket.com"
+DEFAULT_CHAIN_ID = 137
+DEFAULT_PAGE_LIMIT = 100
+DECISION_BUDGET_MS = 1000
+
+
+def market_looks_open(market: Dict[str, object]) -> bool:
+    if bool(market.get("closed")):
+        return False
+    if market.get("accepting_orders") is False or market.get("acceptingOrders") is False:
+        return False
+    if market.get("active") is False:
+        return False
+    status = str(market.get("status", "")).lower()
+    if status in {"closed", "resolved", "ended", "paused"}:
+        return False
+    if status in {"open", "active", "trading", "live"}:
+        return True
+    return True
+
+
+def normalize_market(raw_market: Dict[str, object]) -> Dict[str, object]:
+    market = dict(raw_market)
+    # Promote event-level fields when present
+    if not market.get("question") and market.get("title"):
+        market["question"] = market.get("title")
+    if not market.get("group") and market.get("event_id"):
+        market["group"] = market.get("event_id")
+    if not market.get("group_key") and market.get("group"):
+        market["group_key"] = market.get("group")
+
+    if not market.get("id") and market.get("condition_id"):
+        market["id"] = market.get("condition_id")
+    if not market.get("market_slug") and market.get("slug"):
+        market["market_slug"] = market.get("slug")
+    if not market.get("slug") and market.get("market_slug"):
+        market["slug"] = market.get("market_slug")
+
+    def _coerce_list(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                return []
         return []
 
-    if not os.path.exists(csv_path):
-        print(f"DEBUG: CSV {csv_path} not found; skipping CSV market load")
-        return []
+    outcomes_value = market.get("outcomes")
+    outcome_prices = _coerce_list(market.get("outcomePrices") or market.get("outcome_prices"))
+    clob_token_ids = _coerce_list(market.get("clobTokenIds") or market.get("token_ids"))
+    liquidity_val = market.get("liquidityNum") or market.get("liquidity") or 0
 
-    df = pd.read_csv(csv_path, low_memory=False)
-    required_cols = {"condition_id", "question", "market_slug", "tokens"}
-    if not required_cols.issubset(set(df.columns)):
-        print(f"DEBUG: CSV missing required columns {required_cols}; found {df.columns}")
-        return []
-
-    markets: List[Market] = []
-    for _, row in df.iterrows():
-        try:
-            tokens = ast.literal_eval(row["tokens"])
-        except Exception:
-            tokens = []
-
-        outcomes: List[Outcome] = []
+    if not outcomes_value:
+        outcomes = []
+        tokens = market.get("tokens") or []
         for token in tokens if isinstance(tokens, list) else []:
-            outcome_name = token.get("outcome")
-            if not outcome_name:
-                continue
             best_bid = token.get("best_bid")
             best_ask = token.get("best_ask")
             price = token.get("price")
-            try:
-                best_bid = float(best_bid) if best_bid is not None else None
-            except (TypeError, ValueError):
-                best_bid = None
-            try:
-                best_ask = float(best_ask) if best_ask is not None else None
-            except (TypeError, ValueError):
-                best_ask = None
-            try:
-                price = float(price) if price is not None else None
-            except (TypeError, ValueError):
-                price = None
-            # Fallback: if no bid/ask, use price as mid
             if best_bid is None and best_ask is None and price is not None:
                 best_bid = best_ask = price
-            liquidity = token.get("liquidity", 0)
-            try:
-                liquidity = float(liquidity) if liquidity is not None else 0.0
-            except (TypeError, ValueError):
-                liquidity = 0.0
-            outcomes.append(Outcome(token.get("token_id"), outcome_name, best_bid, best_ask, liquidity))
+            outcomes.append(
+                {
+                    "id": token.get("token_id"),
+                    "name": token.get("outcome"),
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "liquidity": token.get("liquidity", 0),
+                }
+            )
+        market["outcomes"] = outcomes
+    else:
+        # Normalize string/list outcomes into outcome dicts if they are not already dicts
+        if isinstance(outcomes_value, list) and all(isinstance(o, dict) for o in outcomes_value):
+            pass  # already in desired form
+        else:
+            outcomes_list = _coerce_list(outcomes_value)
+            normalized_outcomes = []
+            for idx, name in enumerate(outcomes_list):
+                price_val = None
+                if idx < len(outcome_prices):
+                    try:
+                        price_val = float(outcome_prices[idx])
+                    except (TypeError, ValueError):
+                        price_val = None
+                try:
+                    liquidity_float = float(liquidity_val) if liquidity_val is not None else 0.0
+                except (TypeError, ValueError):
+                    liquidity_float = 0.0
+                normalized_outcomes.append(
+                    {
+                        "id": clob_token_ids[idx] if idx < len(clob_token_ids) else None,
+                        "name": name,
+                        "best_bid": price_val,
+                        "best_ask": price_val,
+                        "liquidity": liquidity_float,
+                    }
+                )
+            market["outcomes"] = normalized_outcomes
 
-        market = Market(
-            market_id=row.get("condition_id") or row.get("market_id") or row.get("question_id"),
-            question=row.get("question", ""),
-            group_key=row.get("group") or row.get("event_id") or row.get("condition_id"),
-            outcomes=outcomes,
-            rules=row.get("rules", ""),
-            volume=float(row.get("volume", 0) or 0),
-            end_time=row.get("end_date_iso"),
-            slug=row.get("market_slug") or row.get("slug"),
+    return market
+
+
+def _extract_markets_from_event(event: Dict[str, object], verbose: bool = False) -> List[Dict[str, object]]:
+    markets = event.get("markets") or []
+    if not isinstance(markets, list):
+        if verbose:
+            print(f"DEBUG: event {event.get('id')} has no markets list")
+        return []
+
+    enriched: List[Dict[str, object]] = []
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        m = dict(m)
+        # Bring event context into the market
+        m.setdefault("event_id", event.get("id"))
+        m.setdefault("question", event.get("question") or event.get("title"))
+        m.setdefault("group", event.get("group") or event.get("id"))
+        m.setdefault("group_key", event.get("group") or event.get("id"))
+        enriched.append(m)
+    return enriched
+
+
+def _stream_markets_via_events(
+    gamma_host: str,
+    status_filter: str,
+    page_limit: int,
+    verbose: bool = False,
+) -> Generator[Dict[str, object], None, None]:
+    offset = 0
+    page = 0
+    while True:
+        page += 1
+        params = {
+            "order": "id",
+            "ascending": "false",
+            "closed": "false",
+            "limit": page_limit,
+            "offset": offset,
+        }
+        url = f"{gamma_host.rstrip('/')}/events"
+        try:
+            if verbose:
+                print(f"DEBUG: GET {url} page={page} offset={offset} limit={page_limit}")
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            print(f"ERROR: failed to fetch events from {url}: {exc}")
+            return
+
+        if isinstance(payload, list):
+            events = payload
+        elif isinstance(payload, dict):
+            events = payload.get("data") or payload.get("events") or []
+        else:
+            events = []
+            if verbose:
+                print(f"DEBUG: unexpected payload type from {url}: {type(payload)}")
+
+        if verbose:
+            print(f"DEBUG: received {len(events)} events on page {page}")
+        if not events:
+            break
+
+        for e_idx, event in enumerate(events, start=1):
+            for m_idx, market in enumerate(_extract_markets_from_event(event, verbose=verbose), start=1):
+                normalized = normalize_market(market)
+                if status_filter != "all":
+                    is_open = market_looks_open(normalized)
+                    if status_filter == "open" and not is_open:
+                        if verbose:
+                            print(
+                                f"DEBUG: skip market {normalized.get('slug')} not open "
+                                f"(event_page={page} event_item={e_idx} market_item={m_idx})"
+                            )
+                        continue
+                    if status_filter == "closed" and is_open:
+                        if verbose:
+                            print(
+                                f"DEBUG: skip market {normalized.get('slug')} open while filtering closed "
+                                f"(event_page={page} event_item={e_idx} market_item={m_idx})"
+                            )
+                        continue
+                if verbose:
+                    print(
+                        f"DEBUG: yield market {normalized.get('slug')} id={normalized.get('id')} "
+                        f"event_id={normalized.get('event_id')} event_page={page} event_item={e_idx} market_item={m_idx}"
+                    )
+                yield normalized
+
+        if len(events) < page_limit:
+            break
+        offset += page_limit
+
+
+def stream_live_markets(
+    host: str,
+    chain_id: int,
+    status_filter: str = "open",
+    source: str = "gamma",
+    gamma_host: str = DEFAULT_GAMMA_HOST,
+    page_limit: int = DEFAULT_PAGE_LIMIT,
+    verbose: bool = False,
+) -> Generator[Dict[str, object], None, None]:
+    if source == "gamma":
+        yield from _stream_markets_via_events(
+            gamma_host=gamma_host,
+            status_filter=status_filter,
+            page_limit=page_limit,
+            verbose=verbose,
         )
-        markets.append(market)
+        return
 
-    print(f"DEBUG: loaded {len(markets)} markets from CSV ({csv_path})")
-    return markets
+    if ClobClient is None:
+        raise ImportError("py_clob_client is required for live scanning but is not installed")
+
+    if load_dotenv:
+        load_dotenv("keys.env")
+        if verbose:
+            print("DEBUG: loaded keys.env (if present)")
+
+    api_key = os.getenv("API_KEY") or os.getenv("POLYMARKET_API_KEY")
+    if verbose:
+        print(f"DEBUG: using API key set? {'yes' if api_key else 'no'}")
+    client = ClobClient(host, key=api_key, chain_id=chain_id) if api_key else ClobClient(host, chain_id=chain_id)
+
+    cursor: Optional[str] = None
+    page = 0
+    while True:
+        page += 1
+        try:
+            if verbose:
+                print(f"DEBUG: fetching markets page={page} cursor={cursor}")
+            response = client.get_markets() if cursor is None else client.get_markets(next_cursor=cursor)
+        except Exception as exc:
+            print(f"ERROR: unable to fetch markets: {exc}")
+            return
+
+        if not isinstance(response, dict):
+            print(f"ERROR: unexpected response type {type(response)}")
+            return
+
+        payload = response.get("data") or response.get("markets") or []
+        if not payload:
+            if verbose:
+                print(f"DEBUG: empty payload on page {page}")
+            break
+
+        if verbose:
+            print(f"DEBUG: received {len(payload)} markets on page {page}")
+
+        for idx, raw_market in enumerate(payload, start=1):
+            normalized = normalize_market(raw_market)
+            if status_filter != "all":
+                is_open = market_looks_open(normalized)
+                if status_filter == "open" and not is_open:
+                    if verbose:
+                        print(f"DEBUG: skip market {normalized.get('slug')} not open (page {page} item {idx})")
+                    continue
+                if status_filter == "closed" and is_open:
+                    if verbose:
+                        print(f"DEBUG: skip market {normalized.get('slug')} open while filtering closed (page {page} item {idx})")
+                    continue
+            if verbose:
+                print(
+                    f"DEBUG: yield market {normalized.get('slug')} id={normalized.get('id')} "
+                    f"q={normalized.get('question')!r} page={page} item={idx}"
+                )
+            yield normalized
+
+        cursor = response.get("next_cursor") or response.get("nextCursor")
+        if verbose:
+            print(f"DEBUG: next cursor={cursor}")
+        if not cursor:
+            break
+
+
+def ensure_csv(path: str, verbose: bool = False) -> None:
+    directory = os.path.dirname(path)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+        if verbose:
+            print(f"DEBUG: created directory {directory} for CSV")
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            writer.writeheader()
+        if verbose:
+            print(f"DEBUG: wrote CSV header to {path}")
+
+
+def append_opportunity_csv(path: str, opportunity: Dict[str, object], decision_ms: float, verbose: bool = False) -> None:
+    ensure_csv(path, verbose=verbose)
+    row = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "slug": opportunity.get("slug"),
+        "market_id": (opportunity.get("market_ids") or [None])[0],
+        "question": opportunity.get("question"),
+        "net_edge": opportunity.get("net_edge"),
+        "gross_edge": opportunity.get("gross_edge"),
+        "total_ask": opportunity.get("total_ask"),
+        "total_liquidity": opportunity.get("total_liquidity"),
+        "decision_ms": round(decision_ms, 3),
+    }
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer.writerow(row)
+    if verbose:
+        print(f"DEBUG: appended CSV row for slug={opportunity.get('slug')} decision_ms={decision_ms:.3f}")
+
+
+def evaluate_market(
+    client: PolymarketClient,
+    raw_market: Dict[str, object],
+    min_edge: float,
+    verbose: bool = False,
+) -> Tuple[Optional[Dict[str, object]], float]:
+    start = time.perf_counter()
+    try:
+        parsed = client.parse_markets([raw_market])
+    except Exception as exc:
+        outcomes_val = raw_market.get("outcomes")
+        print(
+            f"DEBUG: failed to parse market {raw_market.get('slug') or raw_market.get('market_slug')}: {exc} "
+            f"(outcomes type={type(outcomes_val)})"
+        )
+        return None, (time.perf_counter() - start) * 1000
+
+    market = parsed[0] if parsed else None
+    if market is None:
+        return None, (time.perf_counter() - start) * 1000
+
+    opportunity = compute_simple_sum_arb(market, min_edge=min_edge)
+    decision_ms = (time.perf_counter() - start) * 1000
+    if verbose:
+        ask_sum = f"{opportunity['total_ask']:.4f}" if opportunity and "total_ask" in opportunity else "n/a"
+        liquidity = opportunity.get("total_liquidity") if opportunity else "n/a"
+        edge_msg = (
+            f"net_edge={opportunity['net_edge']:.4f} gross_edge={opportunity['gross_edge']:.4f}"
+            if opportunity
+            else "no opportunity"
+        )
+        print(
+            f"DEBUG: evaluated slug={getattr(market, 'slug', None)} "
+            f"ask_sum={ask_sum} "
+            f"liquidity={liquidity} "
+            f"{edge_msg} decision_ms={decision_ms:.2f}"
+        )
+    return opportunity, decision_ms
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scan Polymarket markets for arbitrage.")
+    parser = argparse.ArgumentParser(description="Stream Polymarket markets and scan each one for arbitrage in real time.")
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE, help="Minimum net edge to report.")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="CLOB host to pull live markets from.")
+    parser.add_argument("--gamma-host", default=DEFAULT_GAMMA_HOST, help="Gamma API host for events/markets.")
+    parser.add_argument("--chain-id", type=int, default=DEFAULT_CHAIN_ID, help="Chain ID used by the CLOB host.")
     parser.add_argument(
-        "--include-strategies",
+        "--status-filter",
+        choices=["open", "closed", "all"],
+        default="open",
+        help="Filter markets before scanning.",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["gamma", "clob"],
+        default="gamma",
+        help="Data source for markets (gamma events API or CLOB).",
+    )
+    parser.add_argument(
+        "--page-limit",
+        type=int,
+        default=DEFAULT_PAGE_LIMIT,
+        help="Page size when pulling events from the gamma API.",
+    )
+    parser.add_argument(
+        "--csv-path",
+        default="data/arbitrage_hits.csv",
+        help="Where to append arbitrage opportunities.",
+    )
+    parser.add_argument(
+        "--json-path",
+        default="data/opportunities.json",
+        help="Optional JSON snapshot of found opportunities.",
+    )
+    parser.add_argument(
+        "--decision-budget-ms",
+        type=int,
+        default=DECISION_BUDGET_MS,
+        help="Warn if a per-market decision exceeds this many milliseconds.",
+    )
+    parser.add_argument(
+        "--verbose",
         action="store_true",
-        help="Evaluate multi-leg strategies defined in Polymarket_arbitrage_EC/strategies.py",
-    )
-    parser.add_argument(
-        "--auto-discover",
-        action="store_true",
-        help="Automatically discover strategies from markets_data and market_lookup.",
-    )
-    parser.add_argument(
-        "--price-source",
-        choices=["ask", "mid", "bid", "live", "actual"],
-        default="ask",
-        help="Price source to use when evaluating multi-leg strategies.",
-    )
-    parser.add_argument(
-        "--user-id",
-        default=None,
-        help="User ID for 'actual' pricing (expects enriched trades parquet).",
-    )
-    parser.add_argument(
-        "--skip-refresh",
-        action="store_true",
-        help="Skip regenerating markets CSV (use existing data/markets_data.csv).",
+        help="Print detailed debug output for every step.",
     )
     args = parser.parse_args()
 
     client = PolymarketClient()
-
-    raw_markets = fetch_markets_data(status_filter="open", include_fake=True)
-    markets = client.parse_markets(raw_markets)
-    print(f"DEBUG: fetched {len(markets)} markets from API helper (open filter + fake included)")
-
-    if not args.skip_refresh:
-        generate_markets_csv()  # still available for lookup generation if needed
-
-    strategies = []
-    if args.auto_discover:
-        from polymarket_arb.market_cache import build_market_lookup_from_csv, load_market_lookup
-        from polymarket_arb.trade_discovery import discover_trades
-
-        # Build lookup based on freshly generated CSV
-        build_market_lookup_from_csv()
-        load_market_lookup()
-        strategies = discover_trades()
+    opportunities: List[Dict[str, object]] = []
+    scanned = 0
 
     print(
-        f"DEBUG: running scan with min_edge={args.min_edge}, "
-        f"include_strategies={args.include_strategies}, "
-        f"auto_discover={args.auto_discover}, "
-        f"price_source={args.price_source}, "
-        f"user_id={args.user_id}"
+        f"Streaming markets source={args.source} "
+        f"gamma_host={args.gamma_host if args.source == 'gamma' else 'n/a'} "
+        f"clob_host={args.host if args.source == 'clob' else 'n/a'} "
+        f"(chain_id={args.chain_id}) status={args.status_filter}; "
+        f"min_edge={args.min_edge}, decision budget={args.decision_budget_ms}ms"
     )
-    print(f"DEBUG: total markets to scan after merge: {len(markets)}")
 
-    simple_opps = scan_markets(client=client, markets=markets, min_edge=args.min_edge)
-    all_opps = list(simple_opps)
-    print(f"DEBUG: found {len(simple_opps)} single-market opportunities")
+    for raw_market in stream_live_markets(
+        host=args.host,
+        chain_id=args.chain_id,
+        status_filter=args.status_filter,
+        source=args.source,
+        gamma_host=args.gamma_host,
+        page_limit=args.page_limit,
+        verbose=args.verbose,
+    ):
+        scanned += 1
+        opportunity, decision_ms = evaluate_market(
+            client,
+            raw_market,
+            min_edge=args.min_edge,
+            verbose=args.verbose,
+        )
+        slug = raw_market.get("slug") or raw_market.get("market_slug") or raw_market.get("question", "")
 
-    if simple_opps:
-        print("Single-market sum arbitrage:")
-        for o in simple_opps:
-            slug = o.get("slug") or ""
-            market_id = o.get("market_ids", [None])[0]
+        if opportunity:
+            opportunities.append(opportunity)
+            append_opportunity_csv(args.csv_path, opportunity, decision_ms, verbose=args.verbose)
             print(
-                f"[{o['type']}] slug={slug} id={market_id} question={o['question']} "
-                f"| net_edge={o['net_edge']:.4f} gross_edge={o['gross_edge']:.4f} "
-                f"total_ask={o['total_ask']:.4f} liquidity={o.get('total_liquidity', 'n/a')}"
+                f"[HIT] slug={slug} net_edge={opportunity['net_edge']:.4f} "
+                f"gross_edge={opportunity['gross_edge']:.4f} total_ask={opportunity['total_ask']:.4f} "
+                f"liquidity={opportunity.get('total_liquidity')} decision_ms={decision_ms:.1f}"
             )
+        elif decision_ms > args.decision_budget_ms:
+            print(f"DEBUG: decision for slug={slug} took {decision_ms:.1f}ms (over budget)")
+
+    if opportunities:
+        save_opportunities(opportunities, path=args.json_path)
+        print(f"Finished scanning {scanned} markets; found {len(opportunities)} opportunities. CSV: {args.csv_path}")
     else:
-        print("No single-market opportunities found")
-
-    if args.include_strategies:
-        try:
-            from Polymarket_arbitrage_EC.strategies import trades as strategies  # type: ignore
-        except Exception as exc:
-            print(f"Skipping strategy scan (unable to import strategies: {exc})")
-            strategy_opps = []
-        else:
-            strategy_opps = scan_strategy_baskets(
-                markets,
-                strategies,
-                min_edge=args.min_edge,
-                price_source=args.price_source,
-                user_id=args.user_id,
-            )
-            if strategy_opps:
-                print("\nStrategy basket opportunities:")
-                for o in strategy_opps:
-                    print(f"[{o['strategy']}] method={o['method']} | net_edge={o['net_edge']:.4f}")
-            else:
-                print("\nNo strategy basket opportunities found")
-            print(f"DEBUG: found {len(strategy_opps)} strategy opportunities (include_strategies)")
-        all_opps.extend(strategy_opps)
-    elif args.auto_discover:
-        if strategies:
-            strategy_opps = scan_strategy_baskets(
-                markets,
-                strategies,
-                min_edge=args.min_edge,
-                price_source=args.price_source,
-                user_id=args.user_id,
-            )
-            if strategy_opps:
-                print("\nStrategy basket opportunities (auto-discovered):")
-                for o in strategy_opps:
-                    print(f"[{o['strategy']}] method={o['method']} | net_edge={o['net_edge']:.4f}")
-            else:
-                print("\nNo auto-discovered strategy opportunities found")
-            print(f"DEBUG: found {len(strategy_opps)} strategy opportunities (auto-discover)")
-            all_opps.extend(strategy_opps)
-        else:
-            print("\nNo strategies discovered; skipping strategy scan")
-
-    if not all_opps:
-        print("No opportunities found")
-
-    save_opportunities(all_opps)
+        print(f"Finished scanning {scanned} markets; no opportunities found.")
 
 
 if __name__ == "__main__":
